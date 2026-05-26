@@ -1,6 +1,7 @@
 #!/bin/bash
 # examples/profiling/qwen_action_head_bench/run.sh
-# Loops OFT/PI/FAST, invokes model_prof's prof.sh, which auto-routes to nsys (GPU) or asys (PPU).
+# Loops OFT/PI/FAST, invokes model_prof's prof.sh on rank 0 only (via bench_wrap.py).
+# Auto-routes to nsys (GPU) or asys (PPU).
 set -euo pipefail
 
 # === Modify these to your environment ===
@@ -29,15 +30,14 @@ fi
 for HEAD in ${HEADS}; do
     REPORT_PREFIX="${OUT_DIR}/bench_${HEAD}"
     echo "============================================================"
-    echo "[run.sh] profiling head=${HEAD} -> ${REPORT_PREFIX}"
+    echo "[run.sh] profiling head=${HEAD} (rank-0 only) -> ${REPORT_PREFIX}"
     echo "============================================================"
 
-    "${PROF_DIR}/model_prof/tool/prof.sh" \
-        "${REPORT_PREFIX}" \
+    PROF_DIR="${PROF_DIR}" REPORT_PREFIX="${REPORT_PREFIX}" \
         accelerate launch \
             --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
             --num_processes "${NUM_GPUS}" \
-            examples/profiling/qwen_action_head_bench/bench.py \
+            examples/profiling/qwen_action_head_bench/bench_wrap.py \
             --head "${HEAD}" \
             --base_vlm "${BASE_VLM}" \
             --data_root "${DATA_ROOT}" \

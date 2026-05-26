@@ -74,6 +74,8 @@ out_profile/
 └── fixed_batch.pt                  # frozen LIBERO batch, identical across heads
 ```
 
+> nsys/asys trace and CSVs are captured on rank 0 only. NCCL kernels participated in by rank 0 are still visible in the trace, so the cross-hardware comparison is still meaningful.
+
 ### Reading the JSON summary
 
 ```bash
@@ -129,3 +131,11 @@ ensure the workload is byte-identical.
   export NCCL_SOCKET_IFNAME=bond0
   export NCCL_IB_HCA=mlx5_2,mlx5_3
   ```
+- **`Failed to connect to Agent` warnings spam the log on multi-GPU runs**
+  This means nsys is trying to attach to multiple ranks. Confirm `run.sh` is
+  pointing accelerate at `bench_wrap.py` (not `bench.py` directly) — the
+  wrapper ensures only rank 0 goes through `prof.sh`.
+- **`ERROR: Report 'gputrace' could not be found`**
+  Same root cause as the warning above: the `.nsys-rep` is missing or corrupt
+  because multiple ranks raced to write it. Fix is the same — ensure
+  `bench_wrap.py` is in the launch path.
