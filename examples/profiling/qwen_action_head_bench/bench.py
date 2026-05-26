@@ -92,6 +92,26 @@ def build_model(cfg) -> torch.nn.Module:
     return model
 
 
+from starVLA.dataloader import build_dataloader
+
+def build_loader(cfg):
+    """Wrap build_dataloader with bench-friendly overrides (single worker, no shuffle drift)."""
+    # NOTE: per-device batch size is read from cfg.datasets.vla_data.per_device_batch_size
+    return build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
+
+def get_or_dump_batch(loader, batch_path: str) -> object:
+    """Load a frozen batch from disk if present; otherwise fetch one and dump."""
+    p = Path(batch_path)
+    if p.exists():
+        print(f"[bench] loading frozen batch from {p}")
+        return torch.load(p, map_location="cpu")
+    print(f"[bench] dumping one batch from dataloader to {p}")
+    batch = next(iter(loader))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(batch, p)
+    return batch
+
+
 def main():
     args = parse_args()
     cfg = load_config(args)
@@ -105,6 +125,11 @@ def main():
     print(f"[bench] total parameters = {n_params/1e9:.2f}B")
     print(f"[bench] qwen_vl_interface type = {type(model.qwen_vl_interface).__name__}")
     print(f"[bench] action_model type      = {type(model.action_model).__name__}")
+    print("[bench] building dataloader ...")
+    loader = build_loader(cfg)
+    batch_path = args.batch_path or str(Path(args.output_dir) / "fixed_batch.pt")
+    batch = get_or_dump_batch(loader, batch_path)
+    print(f"[bench] batch type = {type(batch).__name__}, len = {len(batch) if hasattr(batch, '__len__') else '?'}")
     return 0
 
 
