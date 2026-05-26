@@ -287,6 +287,66 @@ def run_loop_profiled(model, optimizer, batch, args, hooks_target):
     return step_times
 
 
+def compute_input_stats(batch) -> dict:
+    """Best-effort inspection of the frozen batch to record sequence shapes."""
+    stats = {}
+    try:
+        # batch is list[dict] per starVLA convention
+        first = batch[0] if isinstance(batch, (list, tuple)) else batch
+        if isinstance(first, dict):
+            if "image" in first:
+                img = first["image"]
+                if hasattr(img, "__len__"):
+                    stats["n_images_per_sample"] = len(img)
+            if "lang" in first:
+                stats["lang_chars_per_sample"] = len(first["lang"])
+            if "action" in first:
+                a = first["action"]
+                stats["action_shape"] = list(getattr(a, "shape", []))
+        stats["batch_len"] = len(batch) if hasattr(batch, "__len__") else None
+    except Exception as e:
+        stats["error"] = repr(e)
+    return stats
+
+
+def write_summary(args, cfg, step_times, batch, out_path: Path):
+    """Roll the run into a JSON file for cross-hardware comparison."""
+    warmup, active = args.warmup_steps, args.active_steps
+    traced = step_times[warmup:warmup + active]
+    mean_total_ms = (sum(traced) / max(len(traced), 1)) * 1000
+
+    peak_alloc = peak_reserved = 0.0
+    if torch.cuda.is_available():
+        peak_alloc = torch.cuda.max_memory_allocated() / 1e9
+        peak_reserved = torch.cuda.max_memory_reserved() / 1e9
+
+    summary = {
+        "head": args.head,
+        "framework_name": cfg.framework.name,
+        "backbone": cfg.framework.qwenvl.base_vlm,
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+        "per_device_batch_size": int(cfg.datasets.vla_data.per_device_batch_size),
+        "step_count": {
+            "warmup": args.warmup_steps,
+            "traced": args.active_steps,
+            "cooldown": args.cooldown_steps,
+        },
+        "input_stats": compute_input_stats(batch),
+        "timings_ms": {
+            "step_total_mean_traced": mean_total_ms,
+            # Per-range means are computed offline from the torch.profiler trace;
+            # this JSON is the high-level wall-clock summary.
+            "per_step_ms_all_steps": [t * 1000 for t in step_times],
+        },
+        "memory_gb": {
+            "peak_allocated": peak_alloc,
+            "peak_reserved": peak_reserved,
+        },
+    }
+    out_path.write_text(json.dumps(summary, indent=2))
+    print(f"[bench] wrote summary -> {out_path}")
+
+
 def main():
     args = parse_args()
     if args.selftest_hooks:
@@ -330,8 +390,11 @@ def main():
     print(f"[bench] starting profiled loop for {total_steps} steps "
           f"(warmup={args.warmup_steps}, active={args.active_steps}, cooldown={args.cooldown_steps})")
     step_times = run_loop_profiled(model, optimizer, batch, args, hooks_target)
-    print(f"[bench] loop done. mean step time over traced window = "
-          f"{sum(step_times[args.warmup_steps:args.warmup_steps+args.active_steps]) / max(args.active_steps,1) * 1000:.1f}ms")
+    mean_traced = sum(step_times[args.warmup_steps:args.warmup_steps+args.active_steps]) / max(args.active_steps, 1)
+    print(f"[bench] loop done. mean traced step = {mean_traced*1000:.1f}ms")
+
+    summary_path = Path(args.output_dir) / f"bench_{args.head}_summary.json"
+    write_summary(args, cfg, step_times, batch, summary_path)
     return 0
 
 
