@@ -32,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cooldown_steps", type=int, default=5)
     p.add_argument("--no_profile", action="store_true",
                    help="Run the loop without torch.profiler — useful for smoke testing.")
+    p.add_argument("--selftest_hooks", action="store_true",
+                   help="Run a local hook-firing self-test and exit.")
     return p.parse_args()
 
 
@@ -112,8 +114,82 @@ def get_or_dump_batch(loader, batch_path: str) -> object:
     return batch
 
 
+from contextlib import contextmanager
+
+@contextmanager
+def prof_range(name: str):
+    """Push both NVTX range (for nsys/asys) and record_function (for torch.profiler).
+
+    On PPU `torch.cuda.nvtx` becomes a no-op, which is fine — the PPU side
+    relies on model_prof's libnvToolsExt loading instead.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+    rf = torch.profiler.record_function(name)
+    rf.__enter__()
+    try:
+        yield
+    finally:
+        rf.__exit__(None, None, None)
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_pop()
+
+
+def register_module_hooks(model: torch.nn.Module, name_to_module: dict) -> list:
+    """Attach pre/post forward hooks that push NVTX + record_function around each module.
+
+    Returns a list of hook handles so the caller can `.remove()` them later.
+    """
+    handles = []
+    for label, module in name_to_module.items():
+        def make_hooks(_label):
+            def pre(mod, _inputs):
+                if torch.cuda.is_available():
+                    torch.cuda.nvtx.range_push(_label)
+                rf = torch.profiler.record_function(_label)
+                rf.__enter__()
+                mod._bench_prof_ctx = rf
+            def post(mod, _inputs, _outputs):
+                ctx = getattr(mod, "_bench_prof_ctx", None)
+                if ctx is not None:
+                    ctx.__exit__(None, None, None)
+                    del mod._bench_prof_ctx
+                if torch.cuda.is_available():
+                    torch.cuda.nvtx.range_pop()
+            return pre, post
+        pre_h, post_h = make_hooks(label)
+        handles.append(module.register_forward_pre_hook(pre_h))
+        handles.append(module.register_forward_hook(post_h))
+    return handles
+
+
+def _selftest_hooks():
+    """Local-only sanity check that hooks fire in the right order."""
+    seen = []
+
+    class FakeRF:
+        def __init__(self, name): self.name = name
+        def __enter__(self): seen.append(f"rf_enter:{self.name}"); return self
+        def __exit__(self, *a): seen.append(f"rf_exit:{self.name}")
+
+    # Monkey-patch record_function for this call only
+    real_rf = torch.profiler.record_function
+    torch.profiler.record_function = FakeRF
+    try:
+        m = torch.nn.Linear(4, 4)
+        register_module_hooks(m, {"toy_forward": m})
+        m(torch.zeros(1, 4))
+    finally:
+        torch.profiler.record_function = real_rf
+    assert seen == ["rf_enter:toy_forward", "rf_exit:toy_forward"], seen
+    print(f"[bench] selftest_hooks OK: {seen}")
+
+
 def main():
     args = parse_args()
+    if args.selftest_hooks:
+        _selftest_hooks()
+        return 0
     cfg = load_config(args)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
