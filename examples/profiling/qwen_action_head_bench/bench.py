@@ -265,8 +265,14 @@ def run_loop_profiled(model, optimizer, batch, args, hooks_target, accelerator):
     warmup, active, cooldown = args.warmup_steps, args.active_steps, args.cooldown_steps
     total = warmup + active + cooldown
 
-    # model_prof window covers the same range torch.profiler is active.
-    mp.set_iter_range(warmup, warmup + active - 1)
+    # Extend mp's iter range past `active` to cover cooldown too. Why: prof.sh
+    # runs `nsys profile --kill 9 -c cudaProfilerApi`, which SIGKILLs python the
+    # instant cudaProfilerStop fires. mp.prof_iter(step==stop_iter+1) auto-fires
+    # prof_stop, so if stop_iter ends inside the loop we get killed before
+    # write_summary runs. By setting stop_iter = total-1, the in-loop auto-stop
+    # never triggers; main() will call mp.prof_stop() *after* writing the JSON.
+    # torch.profiler still only captures `active` steps via its own schedule.
+    mp.set_iter_range(warmup, total - 1)
 
     tb_dir = Path(args.output_dir) / f"tb_trace_{args.head}"
     tb_dir.mkdir(parents=True, exist_ok=True)
@@ -302,8 +308,9 @@ def run_loop_profiled(model, optimizer, batch, args, hooks_target, accelerator):
                 print(f"[bench] step {step:3d} loss={loss.item():.4f} "
                       f"dt={step_times[-1]*1000:.1f}ms")
 
-    # Stop model_prof explicitly (handles edge case where loop ends mid-window)
-    mp.prof_stop()
+    # NOTE: do NOT call mp.prof_stop() here. The caller (main) must write
+    # summary.json first; only then is it safe to stop, since cudaProfilerStop
+    # under nsys --kill 9 will immediately SIGKILL this process.
     return step_times
 
 
@@ -447,10 +454,17 @@ def main():
         summary_path = Path(args.output_dir) / f"bench_{args.head}_summary.json"
         write_summary(args, cfg, step_times, batch, summary_path)
 
+    # Sync, tear down NCCL, *then* stop the profiler. After mp.prof_stop()
+    # nsys --kill 9 will SIGKILL this process, so anything we want to do
+    # cleanly must happen before this line.
     accelerator.wait_for_everyone()
     import torch.distributed as dist
     if dist.is_initialized():
         dist.destroy_process_group()
+
+    if accelerator.is_main_process:
+        import model_prof as mp
+        mp.prof_stop()
     return 0
 
 
