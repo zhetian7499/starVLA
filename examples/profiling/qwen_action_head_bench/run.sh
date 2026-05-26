@@ -20,6 +20,11 @@ mkdir -p "${OUT_DIR}"
 
 export MODEL_PROFILE=1
 export MODEL_PROFILE_RANGE="${WARMUP},$((WARMUP + ACTIVE - 1))"
+# Skip prof.sh's auto CSV generation. Its `nsys stats --report gputrace` invocation
+# is incompatible with newer nsys (CUDA 12.x renamed the report). The .nsys-rep
+# is still produced and openable in Nsight Systems. Set MODEL_PROFILE_SKIP_GENERATE_TRACE_REPORT=0
+# to opt back in if your model_prof / nsys versions are aligned.
+export MODEL_PROFILE_SKIP_GENERATE_TRACE_REPORT="${MODEL_PROFILE_SKIP_GENERATE_TRACE_REPORT:-1}"
 
 if [ ! -x "${PROF_DIR}/model_prof/tool/prof.sh" ]; then
     echo "ERROR: prof.sh not found at ${PROF_DIR}/model_prof/tool/prof.sh"
@@ -32,6 +37,9 @@ for HEAD in ${HEADS}; do
     echo "============================================================"
     echo "[run.sh] profiling head=${HEAD} (rank-0 only) -> ${REPORT_PREFIX}"
     echo "============================================================"
+
+    # Stale sqlite from a prior run confuses `nsys stats`; clean before re-export.
+    rm -f "${REPORT_PREFIX}.sqlite"
 
     PROF_DIR="${PROF_DIR}" REPORT_PREFIX="${REPORT_PREFIX}" \
         accelerate launch \
