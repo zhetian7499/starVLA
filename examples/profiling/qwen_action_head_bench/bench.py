@@ -189,10 +189,23 @@ import time
 from accelerate import Accelerator, DeepSpeedPlugin
 
 
-def setup_accelerator():
-    """Match train_starvla.py's accelerator setup."""
+def setup_accelerator(per_device_batch_size: int):
+    """Build Accelerator. Use DeepSpeed only when launched via `accelerate launch
+    --config_file ...deepspeed_zero2.yaml` (which sets ACCELERATE_USE_DEEPSPEED=true).
+    Single-process `python bench.py ...` runs use plain Accelerator — DeepSpeed
+    is overkill for a smoke test and would require a dataloader passed to .prepare()
+    just to read its batch size.
+    """
+    use_ds = os.environ.get("ACCELERATE_USE_DEEPSPEED", "").lower() == "true"
+    if not use_ds:
+        return Accelerator()
     ds_plugin = DeepSpeedPlugin()
-    return Accelerator(deepspeed_plugin=ds_plugin)
+    acc = Accelerator(deepspeed_plugin=ds_plugin)
+    # DeepSpeed needs train_micro_batch_size_per_gpu to construct ZeRO. We don't
+    # pass a dataloader to .prepare() (the bench manages its own batch), so set it
+    # explicitly here.
+    acc.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = per_device_batch_size
+    return acc
 
 
 def setup_optimizer(model, lr: float = 1e-5):
@@ -392,7 +405,7 @@ def main():
     batch = get_or_dump_batch(loader, batch_path)
     print(f"[bench] batch type = {type(batch).__name__}, len = {len(batch) if hasattr(batch, '__len__') else '?'}")
 
-    accelerator = setup_accelerator()
+    accelerator = setup_accelerator(int(cfg.datasets.vla_data.per_device_batch_size))
     optimizer = setup_optimizer(model)
     model, optimizer = accelerator.prepare(model, optimizer)
 
