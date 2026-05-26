@@ -185,6 +185,56 @@ def _selftest_hooks():
     print(f"[bench] selftest_hooks OK: {seen}")
 
 
+import time
+from accelerate import Accelerator, DeepSpeedPlugin
+
+
+def setup_accelerator():
+    """Match train_starvla.py's accelerator setup."""
+    ds_plugin = DeepSpeedPlugin()
+    return Accelerator(deepspeed_plugin=ds_plugin)
+
+
+def setup_optimizer(model, lr: float = 1e-5):
+    """Minimal AdamW. We don't need an LR scheduler for a 45-step bench."""
+    return torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=lr,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=0.0,
+    )
+
+
+def run_loop(model, optimizer, batch, total_steps: int, hooks_target: dict | None):
+    """Single-process body of the training loop.
+
+    `model` is the *prepared* (Accelerator-wrapped) model. `hooks_target` maps
+    label -> submodule to hook for module-level NVTX/record_function ranges.
+    """
+    if hooks_target is not None:
+        register_module_hooks(model, hooks_target)
+
+    step_times = []
+    for step in range(total_steps):
+        t0 = time.perf_counter()
+        with prof_range("step_total"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out = model(batch)
+                loss = out["action_loss"]
+            with prof_range("backward"):
+                loss.backward()
+            with prof_range("optimizer_step"):
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        step_times.append(dt)
+        if step % 5 == 0:
+            print(f"[bench] step {step:3d} loss={loss.item():.4f} dt={dt*1000:.1f}ms")
+    return step_times
+
+
 def main():
     args = parse_args()
     if args.selftest_hooks:
@@ -206,6 +256,27 @@ def main():
     batch_path = args.batch_path or str(Path(args.output_dir) / "fixed_batch.pt")
     batch = get_or_dump_batch(loader, batch_path)
     print(f"[bench] batch type = {type(batch).__name__}, len = {len(batch) if hasattr(batch, '__len__') else '?'}")
+
+    accelerator = setup_accelerator()
+    optimizer = setup_optimizer(model)
+    model, optimizer = accelerator.prepare(model, optimizer)
+
+    # Resolve hook targets after .prepare() may have wrapped the model
+    inner = accelerator.unwrap_model(model)
+    hooks_target = {
+        "vlm_forward": inner.qwen_vl_interface,
+        "action_head_forward": inner.action_model,
+    }
+
+    total_steps = args.warmup_steps + args.active_steps + args.cooldown_steps
+    if args.no_profile:
+        print(f"[bench] starting plain loop for {total_steps} steps")
+        run_loop(model, optimizer, batch, total_steps=total_steps, hooks_target=hooks_target)
+        print("[bench] loop done (no profile)")
+        return 0
+
+    # Profile-enabled path comes in Task 7.
+    print("[bench] --no_profile not set; profile path not yet implemented")
     return 0
 
 
