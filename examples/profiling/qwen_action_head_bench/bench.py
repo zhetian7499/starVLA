@@ -106,7 +106,7 @@ def get_or_dump_batch(loader, batch_path: str) -> object:
     p = Path(batch_path)
     if p.exists():
         print(f"[bench] loading frozen batch from {p}")
-        return torch.load(p, map_location="cpu")
+        return torch.load(p, map_location="cpu", weights_only=False)
     print(f"[bench] dumping one batch from dataloader to {p}")
     batch = next(iter(loader))
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -219,11 +219,14 @@ def setup_optimizer(model, lr: float = 1e-5):
     )
 
 
-def run_loop(model, optimizer, batch, total_steps: int, hooks_target: dict | None):
+def run_loop(model, optimizer, batch, total_steps: int, hooks_target: dict | None, accelerator):
     """Single-process body of the training loop.
 
     `model` is the *prepared* (Accelerator-wrapped) model. `hooks_target` maps
     label -> submodule to hook for module-level NVTX/record_function ranges.
+    `accelerator` is required to route backward through DeepSpeed engine when
+    ZeRO is enabled — calling `loss.backward()` directly trips ZeRO-2's
+    "parameter already reduced" assertion.
     """
     if hooks_target is not None:
         register_module_hooks(model, hooks_target)
@@ -235,8 +238,8 @@ def run_loop(model, optimizer, batch, total_steps: int, hooks_target: dict | Non
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 out = model(batch)
                 loss = out["action_loss"]
-            with prof_range("backward"):
-                loss.backward()
+            with prof_range("backward"):                                                                                                                                 
+                accelerator.backward(loss)  
             with prof_range("optimizer_step"):
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -248,8 +251,12 @@ def run_loop(model, optimizer, batch, total_steps: int, hooks_target: dict | Non
     return step_times
 
 
-def run_loop_profiled(model, optimizer, batch, args, hooks_target):
-    """Loop with torch.profiler schedule + model_prof iter-range."""
+def run_loop_profiled(model, optimizer, batch, args, hooks_target, accelerator):
+    """Loop with torch.profiler schedule + model_prof iter-range.
+
+    `accelerator` required for the same reason as `run_loop` — backward
+    must route through DeepSpeed engine via `accelerator.backward(loss)`.
+    """
     import model_prof as mp
 
     if hooks_target is not None:
@@ -284,7 +291,7 @@ def run_loop_profiled(model, optimizer, batch, args, hooks_target):
                     out = model(batch)
                     loss = out["action_loss"]
                 with prof_range("backward"):
-                    loss.backward()
+                    accelerator.backward(loss)
                 with prof_range("optimizer_step"):
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -418,19 +425,32 @@ def main():
 
     total_steps = args.warmup_steps + args.active_steps + args.cooldown_steps
     if args.no_profile:
-        print(f"[bench] starting plain loop for {total_steps} steps")
-        run_loop(model, optimizer, batch, total_steps=total_steps, hooks_target=hooks_target)
-        print("[bench] loop done (no profile)")
+        if accelerator.is_main_process:
+            print(f"[bench] starting plain loop for {total_steps} steps")
+        run_loop(model, optimizer, batch, total_steps=total_steps, hooks_target=None, accelerator=accelerator)
+        if accelerator.is_main_process:
+            print("[bench] loop done (no profile)")
+        accelerator.wait_for_everyone()
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.destroy_process_group()
         return 0
 
-    print(f"[bench] starting profiled loop for {total_steps} steps "
-          f"(warmup={args.warmup_steps}, active={args.active_steps}, cooldown={args.cooldown_steps})")
-    step_times = run_loop_profiled(model, optimizer, batch, args, hooks_target)
+    if accelerator.is_main_process:
+        print(f"[bench] starting profiled loop for {total_steps} steps "
+              f"(warmup={args.warmup_steps}, active={args.active_steps}, cooldown={args.cooldown_steps})")
+    step_times = run_loop_profiled(model, optimizer, batch, args, hooks_target, accelerator)
     mean_traced = sum(step_times[args.warmup_steps:args.warmup_steps+args.active_steps]) / max(args.active_steps, 1)
-    print(f"[bench] loop done. mean traced step = {mean_traced*1000:.1f}ms")
 
-    summary_path = Path(args.output_dir) / f"bench_{args.head}_summary.json"
-    write_summary(args, cfg, step_times, batch, summary_path)
+    if accelerator.is_main_process:
+        print(f"[bench] loop done. mean traced step = {mean_traced*1000:.1f}ms")
+        summary_path = Path(args.output_dir) / f"bench_{args.head}_summary.json"
+        write_summary(args, cfg, step_times, batch, summary_path)
+
+    accelerator.wait_for_everyone()
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.destroy_process_group()
     return 0
 
 
