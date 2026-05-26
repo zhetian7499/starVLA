@@ -64,13 +64,47 @@ def load_config(args: argparse.Namespace):
     return cfg
 
 
+import torch
+import random
+import numpy as np
+from starVLA.model.framework.base_framework import build_framework
+
+def set_global_seed(seed: int = 42):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def build_model(cfg) -> torch.nn.Module:
+    """Build framework; assert the two submodules we want to hook exist."""
+    model = build_framework(cfg)
+    if not hasattr(model, "qwen_vl_interface"):
+        attrs = [a for a in dir(model) if not a.startswith("_")]
+        raise RuntimeError(
+            f"framework missing `qwen_vl_interface`. Available top-level attrs: {attrs}"
+        )
+    if not hasattr(model, "action_model"):
+        attrs = [a for a in dir(model) if not a.startswith("_")]
+        raise RuntimeError(
+            f"framework missing `action_model`. Available top-level attrs: {attrs}"
+        )
+    return model
+
+
 def main():
     args = parse_args()
     cfg = load_config(args)
-    print(f"[bench] resolved framework.name = {cfg.framework.name}")
-    print(f"[bench] resolved base_vlm       = {cfg.framework.qwenvl.base_vlm}")
-    print(f"[bench] resolved data_root      = {cfg.datasets.vla_data.data_root_dir}")
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    set_global_seed(42)
+    print("[bench] building framework ...")
+    model = build_model(cfg)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[bench] framework class = {type(model).__name__}")
+    print(f"[bench] total parameters = {n_params/1e9:.2f}B")
+    print(f"[bench] qwen_vl_interface type = {type(model.qwen_vl_interface).__name__}")
+    print(f"[bench] action_model type      = {type(model.action_model).__name__}")
     return 0
 
 
