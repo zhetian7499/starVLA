@@ -347,6 +347,26 @@ def write_summary(args, cfg, step_times, batch, out_path: Path):
     print(f"[bench] wrote summary -> {out_path}")
 
 
+def ensure_dist_initialized():
+    """Init a 1-process dist group when bench is launched as plain `python`.
+
+    starVLA's dataloader calls dist.get_rank() unconditionally. Under
+    `accelerate launch`, dist is already initialized — this function is a no-op.
+    Under plain `python bench.py`, we synthesize a single-rank group so the
+    dataloader can proceed.
+    """
+    import torch.distributed as dist
+    if dist.is_initialized():
+        return
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29501")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend)
+
+
 def main():
     args = parse_args()
     if args.selftest_hooks:
@@ -354,8 +374,11 @@ def main():
         return 0
     cfg = load_config(args)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    # starVLA's dataloader writes dataset_statistics.json to cfg.output_dir on rank 0.
+    cfg.output_dir = args.output_dir
 
     set_global_seed(42)
+    ensure_dist_initialized()
     print("[bench] building framework ...")
     model = build_model(cfg)
     n_params = sum(p.numel() for p in model.parameters())
