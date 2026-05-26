@@ -235,6 +235,58 @@ def run_loop(model, optimizer, batch, total_steps: int, hooks_target: dict | Non
     return step_times
 
 
+def run_loop_profiled(model, optimizer, batch, args, hooks_target):
+    """Loop with torch.profiler schedule + model_prof iter-range."""
+    import model_prof as mp
+
+    if hooks_target is not None:
+        register_module_hooks(model, hooks_target)
+
+    warmup, active, cooldown = args.warmup_steps, args.active_steps, args.cooldown_steps
+    total = warmup + active + cooldown
+
+    # model_prof window covers the same range torch.profiler is active.
+    mp.set_iter_range(warmup, warmup + active - 1)
+
+    tb_dir = Path(args.output_dir) / f"tb_trace_{args.head}"
+    tb_dir.mkdir(parents=True, exist_ok=True)
+
+    sched = torch.profiler.schedule(
+        wait=0, warmup=warmup, active=active, repeat=1,
+    )
+
+    step_times = []
+    with torch.profiler.profile(
+        schedule=sched,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(str(tb_dir)),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+    ) as tp_prof:
+        for step in range(total):
+            mp.prof_iter(step)
+            t0 = time.perf_counter()
+            with prof_range("step_total"):
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    out = model(batch)
+                    loss = out["action_loss"]
+                with prof_range("backward"):
+                    loss.backward()
+                with prof_range("optimizer_step"):
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+            torch.cuda.synchronize()
+            step_times.append(time.perf_counter() - t0)
+            tp_prof.step()
+            if step % 5 == 0:
+                print(f"[bench] step {step:3d} loss={loss.item():.4f} "
+                      f"dt={step_times[-1]*1000:.1f}ms")
+
+    # Stop model_prof explicitly (handles edge case where loop ends mid-window)
+    mp.prof_stop()
+    return step_times
+
+
 def main():
     args = parse_args()
     if args.selftest_hooks:
@@ -275,8 +327,11 @@ def main():
         print("[bench] loop done (no profile)")
         return 0
 
-    # Profile-enabled path comes in Task 7.
-    print("[bench] --no_profile not set; profile path not yet implemented")
+    print(f"[bench] starting profiled loop for {total_steps} steps "
+          f"(warmup={args.warmup_steps}, active={args.active_steps}, cooldown={args.cooldown_steps})")
+    step_times = run_loop_profiled(model, optimizer, batch, args, hooks_target)
+    print(f"[bench] loop done. mean step time over traced window = "
+          f"{sum(step_times[args.warmup_steps:args.warmup_steps+args.active_steps]) / max(args.active_steps,1) * 1000:.1f}ms")
     return 0
 
 
