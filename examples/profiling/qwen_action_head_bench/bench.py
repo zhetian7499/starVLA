@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
                    help="Which action head to benchmark.")
     p.add_argument("--config_yaml", default="examples/LIBERO/train_files/starvla_cotrain_libero.yaml",
                    help="Base LIBERO config; overridden by --head and CLI dotlist.")
-    p.add_argument("--base_vlm", default="playground/Pretrained_models/Qwen3.5-0.8B",
+    p.add_argument("--base_vlm", default="/mnt/datasets/checkpoints/LLM/Qwen/v1.0/Qwen3.5-0.8B",
                    help="Path to Qwen3.5-0.8B weights on disk.")
     p.add_argument("--data_root", default="playground/Datasets/LEROBOT_LIBERO_DATA",
                    help="Path to LIBERO LeRobot data on disk.")
@@ -70,6 +70,28 @@ import torch
 import random
 import numpy as np
 from starVLA.model.framework.base_framework import build_framework
+
+
+def _apply_tokenizer_file_patch():
+    """Work around transformers 5.x dropping `tokenizer_file` in nested processor
+    loading. Needed by the QwenFast head to load physical-intelligence/fast.
+    Idempotent and harmless to other tokenizers (only fires when tokenizer.json
+    exists next to the model path and no explicit tokenizer_file was passed)."""
+    from transformers import PreTrainedTokenizerFast
+    if getattr(PreTrainedTokenizerFast.__init__, "_bench_patched", False):
+        return
+    _orig = PreTrainedTokenizerFast.__init__
+    def _patched(self, *args, **kwargs):
+        if not kwargs.get("tokenizer_file"):
+            nop = kwargs.get("name_or_path")
+            if nop:
+                cand = os.path.join(nop, "tokenizer.json")
+                if os.path.isfile(cand):
+                    kwargs["tokenizer_file"] = cand
+        return _orig(self, *args, **kwargs)
+    _patched._bench_patched = True
+    PreTrainedTokenizerFast.__init__ = _patched
+
 
 def set_global_seed(seed: int = 42):
     torch.manual_seed(seed)
@@ -405,6 +427,7 @@ def main():
     cfg.output_dir = args.output_dir
 
     set_global_seed(42)
+    _apply_tokenizer_file_patch()
     ensure_dist_initialized()
     print("[bench] building framework ...")
     model = build_model(cfg)
