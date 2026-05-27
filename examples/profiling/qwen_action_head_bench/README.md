@@ -111,10 +111,105 @@ Open `.nsys-rep` in Nsight Systems UI (also runs on macOS).
 
 ## Reproducibility on PPU
 
-Copy the entire directory + `fixed_batch.pt` to the PPU box. `run.sh` will
-auto-detect `asys` instead of `nsys`. Use the exact same `WARMUP/ACTIVE/COOLDOWN`,
-`NUM_GPUS`, and `--batch_path` pointing at the rsync'd `fixed_batch.pt` to
-ensure the workload is byte-identical.
+**Bench Python code is GPU/PPU agnostic — no source edits needed.** All
+compatibility workarounds (DeepSpeed conditional init, `accelerator.backward`
+for ZeRO, deferred `mp.prof_stop`, `tokenizer_file` patch for transformers 5.x)
+are already baked in. The PPU operator only needs to: (a) set 4 paths,
+(b) make one symlink for the FAST tokenizer, (c) bring the GPU-side
+`fixed_batch.pt` over to guarantee identical input.
+
+### Step 1 — Sync this directory and the frozen batch from the GPU side
+
+```bash
+# On the operator's laptop / GPU box (whoever has both endpoints)
+rsync -av <gpu_host>:/path/to/starVLA/examples/profiling/qwen_action_head_bench/ \
+    <ppu_host>:/path/to/starVLA/examples/profiling/qwen_action_head_bench/
+
+# CRITICAL: bring the exact same frozen batch over — otherwise PPU is
+# benching a different input distribution and the numbers are not comparable.
+rsync -av <gpu_host>:/path/to/starVLA/out_profile/fixed_batch.pt \
+    <ppu_host>:/path/to/starVLA/out_profile/fixed_batch.pt
+```
+
+### Step 2 — Resolve four paths on the PPU box
+
+Find these four locations on PPU and remember them:
+
+| What | Used as | Default in `run.sh` |
+|---|---|---|
+| `model_prof` install root | `PROF_DIR` env | `/mnt/ssd/alilab/Model_Center_Pipeline/model_prof` |
+| Qwen3.5-0.8B weights dir | `BASE_VLM` env | `playground/Pretrained_models/Qwen3.5-0.8B` |
+| LIBERO LeRobot data dir | `DATA_ROOT` env | `playground/Datasets/LEROBOT_LIBERO_DATA` |
+| `physical-intelligence/fast` tokenizer dir | symlink target (see Step 3) | — |
+
+### Step 3 — Symlink the FAST tokenizer to where starVLA's `fast_ActionHeader` hard-codes
+
+starVLA's `fast_ActionHeader.py` hard-codes the path `playground/Pretrained_models/fast`.
+Don't fight it; symlink:
+
+```bash
+cd /path/to/starVLA
+mkdir -p playground/Pretrained_models
+ln -sfn /your/ppu/path/to/physical-intelligence/fast \
+        playground/Pretrained_models/fast
+ls playground/Pretrained_models/fast/   # sanity: should list tokenizer.json etc.
+```
+
+If `physical-intelligence/fast` isn't already on the PPU box, download it from
+HuggingFace (model id `physical-intelligence/fast`) — it's small (~700 KB).
+
+### Step 4 — Confirm `asys` is on PATH
+
+```bash
+which asys && asys --version | head -1
+```
+
+If absent, source the PPU SDK env (PPU vendor specific) before running.
+
+### Step 5 — Run
+
+```bash
+cd /path/to/starVLA
+rm -rf out_profile/bench_*   # clean any prior outputs
+
+PROF_DIR=<ppu_model_prof_path> \
+BASE_VLM=<ppu_qwen_path> \
+DATA_ROOT=<ppu_libero_path> \
+NUM_GPUS=<ppu_card_count> \
+    bash examples/profiling/qwen_action_head_bench/run.sh
+```
+
+Defaults are 30 warmup + 10 active + 5 cooldown, 3 heads. ~15-25 min total
+depending on hardware.
+
+### Step 6 — Send results back
+
+The outputs mirror the GPU side, just with `.asysrep` instead of `.nsys-rep`
+and `_ppu*.csv` instead of `_gputrace*.csv`:
+
+```
+out_profile/
+├── bench_OFT.asysrep           ⟷  bench_OFT.nsys-rep on GPU
+├── bench_OFT_ppu.csv           ⟷  bench_OFT_gputrace.csv
+├── bench_OFT_ppu_sum.csv       ⟷  bench_OFT_gputrace_sum.csv
+├── bench_OFT_summary.json      same schema both sides
+├── tb_trace_OFT/               same (torch.profiler chrome trace)
+├── (same for PI and FAST)
+└── fixed_batch.pt              must match GPU's byte-for-byte
+```
+
+Send the whole `out_profile/` directory back. The GPU-side operator does
+side-by-side comparison from `*_summary.json` and the trace files.
+
+### Things that do NOT need to change for PPU
+
+- `bench.py`, `bench_wrap.py`, `run.sh` — **all unmodified**
+- `WARMUP/ACTIVE/COOLDOWN` step counts — keep identical for valid comparison
+- `seed` (hardcoded `42` in bench.py)
+- `per_device_batch_size` (from LIBERO config, 16)
+- The PreTrainedTokenizerFast monkey-patch in `bench.py` is idempotent and only
+  fires when `tokenizer.json` is present next to the model dir — harmless on
+  PPU even if their transformers version doesn't need it.
 
 ## Troubleshooting
 
