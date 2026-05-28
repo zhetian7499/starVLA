@@ -142,7 +142,70 @@ Find these four locations on PPU and remember them:
 | LIBERO LeRobot data dir | `DATA_ROOT` env | `playground/Datasets/LEROBOT_LIBERO_DATA` |
 | `physical-intelligence/fast` tokenizer dir | symlink target (see Step 3) | — |
 
-### Step 3 — Symlink the FAST tokenizer to where starVLA's `fast_ActionHeader` hard-codes
+### Step 3a — (FAST only) Generate the action-augmented Qwen
+
+If you're running `HEADS=FAST` (or the default sweep that includes it), the
+FAST head needs a **Qwen variant whose vocab contains 2047 `<robot_action_N>`
+special tokens** — otherwise `qwenvl_outputs.loss` becomes `None` (all labels
+are -100, ignored), the framework falls back to `tensor(0.0)`, and backward
+crashes with `element 0 of tensors does not require grad and does not have a grad_fn`.
+
+starVLA ships a preprocessing script for this. **The shipped script only knows
+about `Qwen3VLForConditionalGeneration`** — for a Qwen3.5 base (`Qwen3_5ForConditionalGeneration`)
+use this self-contained Python instead (5-10 min on a single GPU, output ~3 GB):
+
+```bash
+cd /path/to/starVLA
+SRC=<your Qwen3.5-0.8B base path>
+DST=playground/Pretrained_models/Qwen3.5-0.8B-Action
+TOK_FILE=starVLA/model/modules/vlm/tools/add_qwen_special_tokens/fast_tokens.txt
+
+CUDA_VISIBLE_DEVICES=0 python - <<PY
+import torch, json, os
+import torch.nn as nn
+from transformers import AutoTokenizer, AutoProcessor, AutoModelForImageTextToText
+
+SRC, DST, TOK_FILE = "$SRC", "$DST", "$TOK_FILE"
+new_tokens = [l.strip() for l in open(TOK_FILE) if l.strip()]
+
+tok = AutoTokenizer.from_pretrained(SRC, trust_remote_code=True)
+old_vocab = len(tok)
+tok.add_special_tokens({"additional_special_tokens": new_tokens})
+
+model = AutoModelForImageTextToText.from_pretrained(SRC, dtype=torch.bfloat16, trust_remote_code=True)
+model.resize_token_embeddings(len(tok), mean_resizing=False)
+emb = model.get_input_embeddings()
+with torch.no_grad():
+    nn.init.normal_(emb.weight[old_vocab:], mean=0.0, std=0.02)
+    out_emb = model.get_output_embeddings()
+    if out_emb is not None and out_emb.weight.data_ptr() != emb.weight.data_ptr():
+        nn.init.normal_(out_emb.weight[old_vocab:], mean=0.0, std=0.02)
+
+os.makedirs(DST, exist_ok=True)
+model.save_pretrained(DST, safe_serialization=True)
+# IMPORTANT: save processor BEFORE the augmented tokenizer, or the processor's
+# embedded original tokenizer will clobber ours.
+AutoProcessor.from_pretrained(SRC, trust_remote_code=True).save_pretrained(DST)
+tok.save_pretrained(DST)
+
+# Verify round-trip
+tok2 = AutoTokenizer.from_pretrained(DST, trust_remote_code=True)
+assert tok2.convert_tokens_to_ids("<robot_action_0>") == old_vocab, "augmentation failed"
+print(f"DONE: len={len(tok2)} robot_action_0_id={old_vocab}")
+PY
+```
+
+Then for the FAST head run, point `BASE_VLM` at `$DST` instead of the bare Qwen:
+
+```bash
+HEADS=FAST BASE_VLM=playground/Pretrained_models/Qwen3.5-0.8B-Action \
+    bash examples/profiling/qwen_action_head_bench/run.sh
+```
+
+OFT and PI **do not** need the augmented Qwen — they're continuous regression
+heads that don't read action tokens.
+
+### Step 3b — Symlink the FAST tokenizer to where starVLA's `fast_ActionHeader` hard-codes
 
 starVLA's `fast_ActionHeader.py` hard-codes the path `playground/Pretrained_models/fast`.
 Don't fight it; symlink:
