@@ -142,70 +142,7 @@ Find these four locations on PPU and remember them:
 | LIBERO LeRobot data dir | `DATA_ROOT` env | `playground/Datasets/LEROBOT_LIBERO_DATA` |
 | `physical-intelligence/fast` tokenizer dir | symlink target (see Step 3) | — |
 
-### Step 3a — (FAST only) Generate the action-augmented Qwen
-
-If you're running `HEADS=FAST` (or the default sweep that includes it), the
-FAST head needs a **Qwen variant whose vocab contains 2047 `<robot_action_N>`
-special tokens** — otherwise `qwenvl_outputs.loss` becomes `None` (all labels
-are -100, ignored), the framework falls back to `tensor(0.0)`, and backward
-crashes with `element 0 of tensors does not require grad and does not have a grad_fn`.
-
-starVLA ships a preprocessing script for this. **The shipped script only knows
-about `Qwen3VLForConditionalGeneration`** — for a Qwen3.5 base (`Qwen3_5ForConditionalGeneration`)
-use this self-contained Python instead (5-10 min on a single GPU, output ~3 GB):
-
-```bash
-cd /path/to/starVLA
-SRC=<your Qwen3.5-0.8B base path>
-DST=playground/Pretrained_models/Qwen3.5-0.8B-Action
-TOK_FILE=starVLA/model/modules/vlm/tools/add_qwen_special_tokens/fast_tokens.txt
-
-CUDA_VISIBLE_DEVICES=0 python - <<PY
-import torch, json, os
-import torch.nn as nn
-from transformers import AutoTokenizer, AutoProcessor, AutoModelForImageTextToText
-
-SRC, DST, TOK_FILE = "$SRC", "$DST", "$TOK_FILE"
-new_tokens = [l.strip() for l in open(TOK_FILE) if l.strip()]
-
-tok = AutoTokenizer.from_pretrained(SRC, trust_remote_code=True)
-old_vocab = len(tok)
-tok.add_special_tokens({"additional_special_tokens": new_tokens})
-
-model = AutoModelForImageTextToText.from_pretrained(SRC, dtype=torch.bfloat16, trust_remote_code=True)
-model.resize_token_embeddings(len(tok), mean_resizing=False)
-emb = model.get_input_embeddings()
-with torch.no_grad():
-    nn.init.normal_(emb.weight[old_vocab:], mean=0.0, std=0.02)
-    out_emb = model.get_output_embeddings()
-    if out_emb is not None and out_emb.weight.data_ptr() != emb.weight.data_ptr():
-        nn.init.normal_(out_emb.weight[old_vocab:], mean=0.0, std=0.02)
-
-os.makedirs(DST, exist_ok=True)
-model.save_pretrained(DST, safe_serialization=True)
-# IMPORTANT: save processor BEFORE the augmented tokenizer, or the processor's
-# embedded original tokenizer will clobber ours.
-AutoProcessor.from_pretrained(SRC, trust_remote_code=True).save_pretrained(DST)
-tok.save_pretrained(DST)
-
-# Verify round-trip
-tok2 = AutoTokenizer.from_pretrained(DST, trust_remote_code=True)
-assert tok2.convert_tokens_to_ids("<robot_action_0>") == old_vocab, "augmentation failed"
-print(f"DONE: len={len(tok2)} robot_action_0_id={old_vocab}")
-PY
-```
-
-Then for the FAST head run, point `BASE_VLM` at `$DST` instead of the bare Qwen:
-
-```bash
-HEADS=FAST BASE_VLM=playground/Pretrained_models/Qwen3.5-0.8B-Action \
-    bash examples/profiling/qwen_action_head_bench/run.sh
-```
-
-OFT and PI **do not** need the augmented Qwen — they're continuous regression
-heads that don't read action tokens.
-
-### Step 3b — Symlink the FAST tokenizer to where starVLA's `fast_ActionHeader` hard-codes
+### Step 3 — Symlink the FAST tokenizer to where starVLA's `fast_ActionHeader` hard-codes
 
 starVLA's `fast_ActionHeader.py` hard-codes the path `playground/Pretrained_models/fast`.
 Don't fight it; symlink:
@@ -221,7 +158,32 @@ ls playground/Pretrained_models/fast/   # sanity: should list tokenizer.json etc
 If `physical-intelligence/fast` isn't already on the PPU box, download it from
 HuggingFace (model id `physical-intelligence/fast`) — it's small (~700 KB).
 
-### Step 4 — Confirm `asys` is on PATH
+### Step 4 — (FAST head only) Augment the Qwen vocab with action tokens
+
+starVLA's QwenFast head maps fast-tokenizer ids to `<robot_action_N>` tokens in
+the LLM vocab. The base Qwen3.5-0.8B doesn't have these tokens; without them
+labels get masked to -100, CE loss is `None`, fallback is a non-grad
+`tensor(0.0)`, and backward fails with "element 0 of tensors does not require
+grad". This step adds the 2048 `<robot_action_N>` tokens and resizes the
+embedding matrix.
+
+starVLA ships `add_special_tokens_to_qwen.py` for this, but it hard-codes
+`Qwen3VLForConditionalGeneration` (fails on Qwen3.5) and saves the processor
+after the augmented tokenizer (clobbers it). We provide a small replacement
+in this directory:
+
+```bash
+cd /path/to/starVLA
+python examples/profiling/qwen_action_head_bench/preprocess_qwen_action_tokens.py \
+    --source <ppu_qwen_path> \
+    --dest playground/Pretrained_models/Qwen3.5-0.8B-Action \
+    --tokens-file starVLA/model/modules/vlm/tools/add_qwen_special_tokens/fast_tokens.txt
+```
+
+Output is ~3 GB. Then point the FAST head's `BASE_VLM` at the augmented dir
+(OFT and PI continue to use the original Qwen — they don't need action tokens).
+
+### Step 5 — Confirm `asys` is on PATH
 
 ```bash
 which asys && asys --version | head -1
@@ -229,23 +191,34 @@ which asys && asys --version | head -1
 
 If absent, source the PPU SDK env (PPU vendor specific) before running.
 
-### Step 5 — Run
+### Step 6 — Run
+
+OFT and PI use the original Qwen; FAST uses the action-augmented Qwen from Step 4:
 
 ```bash
 cd /path/to/starVLA
 rm -rf out_profile/bench_*   # clean any prior outputs
 
+# Round 1: OFT + PI on original Qwen
+HEADS="OFT PI" \
 PROF_DIR=<ppu_model_prof_path> \
 BASE_VLM=<ppu_qwen_path> \
 DATA_ROOT=<ppu_libero_path> \
 NUM_GPUS=<ppu_card_count> \
     bash examples/profiling/qwen_action_head_bench/run.sh
+
+# Round 2: FAST on the augmented Qwen
+HEADS=FAST \
+PROF_DIR=<ppu_model_prof_path> \
+BASE_VLM=playground/Pretrained_models/Qwen3.5-0.8B-Action \
+DATA_ROOT=<ppu_libero_path> \
+NUM_GPUS=<ppu_card_count> \
+    bash examples/profiling/qwen_action_head_bench/run.sh
 ```
 
-Defaults are 30 warmup + 10 active + 5 cooldown, 3 heads. ~15-25 min total
-depending on hardware.
+Defaults are 30 warmup + 10 active + 5 cooldown. Each head ~5-8 min on H20-8; budget similar on PPU.
 
-### Step 6 — Send results back
+### Step 7 — Send results back
 
 The outputs mirror the GPU side, just with `.asysrep` instead of `.nsys-rep`
 and `_ppu*.csv` instead of `_gputrace*.csv`:
