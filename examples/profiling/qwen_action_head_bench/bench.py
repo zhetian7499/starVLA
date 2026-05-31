@@ -30,8 +30,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup_steps", type=int, default=30)
     p.add_argument("--active_steps", type=int, default=10)
     p.add_argument("--cooldown_steps", type=int, default=5)
-    p.add_argument("--no_profile", action="store_true",
-                   help="Run the loop without torch.profiler — useful for smoke testing.")
+    p.add_argument("--profiler", choices=["nsys", "torch", "none"], default="torch",
+                   help="Which profiler stack to enable. 'nsys' uses model_prof's "
+                        "iter-range (assumes the process is wrapped by prof.sh / nsys / asys); "
+                        "'torch' uses torch.profiler with tensorboard handler; "
+                        "'none' is a smoke-test loop with no profiler. Running both "
+                        "nsys and torch in one execution pollutes per-step timing — "
+                        "use two separate runs instead.")
     p.add_argument("--selftest_hooks", action="store_true",
                    help="Run a local hook-firing self-test and exit.")
     return p.parse_args()
@@ -273,8 +278,11 @@ def run_loop(model, optimizer, batch, total_steps: int, hooks_target: dict | Non
     return step_times
 
 
-def run_loop_profiled(model, optimizer, batch, args, hooks_target, accelerator):
-    """Loop with torch.profiler schedule + model_prof iter-range.
+def run_loop_nsys(model, optimizer, batch, args, hooks_target, accelerator):
+    """Loop with only model_prof iter-range (nsys / asys captures externally via prof.sh).
+
+    No torch.profiler wrapping — running both at once doubles CUPTI subscribers
+    and adds end-of-active trace-export stalls that pollute per-step timing.
 
     `accelerator` required for the same reason as `run_loop` — backward
     must route through DeepSpeed engine via `accelerator.backward(loss)`.
@@ -293,26 +301,68 @@ def run_loop_profiled(model, optimizer, batch, args, hooks_target, accelerator):
     # prof_stop, so if stop_iter ends inside the loop we get killed before
     # write_summary runs. By setting stop_iter = total-1, the in-loop auto-stop
     # never triggers; main() will call mp.prof_stop() *after* writing the JSON.
-    # torch.profiler still only captures `active` steps via its own schedule.
     mp.set_iter_range(warmup, total - 1)
 
-    tb_dir = Path(args.output_dir) / f"tb_trace_{args.head}"
+    step_times = []
+    for step in range(total):
+        mp.prof_iter(step)
+        t0 = time.perf_counter()
+        with prof_range("step_total"):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out = model(batch)
+                loss = out["action_loss"]
+            with prof_range("backward"):
+                accelerator.backward(loss)
+            with prof_range("optimizer_step"):
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        step_times.append(time.perf_counter() - t0)
+        if step % 5 == 0:
+            print(f"[bench] step {step:3d} loss={loss.item():.4f} "
+                  f"dt={step_times[-1]*1000:.1f}ms")
+
+    # NOTE: do NOT call mp.prof_stop() here. The caller (main) must write
+    # summary.json first; only then is it safe to stop, since cudaProfilerStop
+    # under nsys --kill 9 will immediately SIGKILL this process.
+    return step_times
+
+
+def run_loop_torch(model, optimizer, batch, args, hooks_target, accelerator):
+    """Loop with only torch.profiler — no model_prof / no outer nsys wrap.
+
+    `accelerator` required for the same reason as `run_loop` — backward
+    must route through DeepSpeed engine via `accelerator.backward(loss)`.
+    """
+    if hooks_target is not None:
+        register_module_hooks(model, hooks_target)
+
+    warmup, active, cooldown = args.warmup_steps, args.active_steps, args.cooldown_steps
+    total = warmup + active + cooldown
+
+    tb_dir = Path(args.output_dir) / f"tb_trace_{args.head}_torch"
     tb_dir.mkdir(parents=True, exist_ok=True)
 
+    # Keep the trace small: a few active steps, no stack frames, no memory events.
+    # Shape info stays on; both CPU + CUDA activities are explicit so we don't
+    # silently lose either if PyTorch changes its defaults.
     sched = torch.profiler.schedule(
         wait=0, warmup=warmup, active=active, repeat=1,
     )
 
     step_times = []
     with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
         schedule=sched,
         on_trace_ready=torch.profiler.tensorboard_trace_handler(str(tb_dir)),
         record_shapes=True,
-        profile_memory=True,
+        profile_memory=False,
         with_stack=False,
     ) as tp_prof:
         for step in range(total):
-            mp.prof_iter(step)
             t0 = time.perf_counter()
             with prof_range("step_total"):
                 with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -329,10 +379,6 @@ def run_loop_profiled(model, optimizer, batch, args, hooks_target, accelerator):
             if step % 5 == 0:
                 print(f"[bench] step {step:3d} loss={loss.item():.4f} "
                       f"dt={step_times[-1]*1000:.1f}ms")
-
-    # NOTE: do NOT call mp.prof_stop() here. The caller (main) must write
-    # summary.json first; only then is it safe to stop, since cudaProfilerStop
-    # under nsys --kill 9 will immediately SIGKILL this process.
     return step_times
 
 
@@ -454,7 +500,7 @@ def main():
     }
 
     total_steps = args.warmup_steps + args.active_steps + args.cooldown_steps
-    if args.no_profile:
+    if args.profiler == "none":
         if accelerator.is_main_process:
             print(f"[bench] starting plain loop for {total_steps} steps")
         run_loop(model, optimizer, batch, total_steps=total_steps, hooks_target=None, accelerator=accelerator)
@@ -467,14 +513,17 @@ def main():
         return 0
 
     if accelerator.is_main_process:
-        print(f"[bench] starting profiled loop for {total_steps} steps "
+        print(f"[bench] starting {args.profiler}-profiled loop for {total_steps} steps "
               f"(warmup={args.warmup_steps}, active={args.active_steps}, cooldown={args.cooldown_steps})")
-    step_times = run_loop_profiled(model, optimizer, batch, args, hooks_target, accelerator)
+    if args.profiler == "nsys":
+        step_times = run_loop_nsys(model, optimizer, batch, args, hooks_target, accelerator)
+    else:  # "torch"
+        step_times = run_loop_torch(model, optimizer, batch, args, hooks_target, accelerator)
     mean_traced = sum(step_times[args.warmup_steps:args.warmup_steps+args.active_steps]) / max(args.active_steps, 1)
 
     if accelerator.is_main_process:
         print(f"[bench] loop done. mean traced step = {mean_traced*1000:.1f}ms")
-        summary_path = Path(args.output_dir) / f"bench_{args.head}_summary.json"
+        summary_path = Path(args.output_dir) / f"bench_{args.head}_{args.profiler}_summary.json"
         write_summary(args, cfg, step_times, batch, summary_path)
 
     # Sync, tear down NCCL, *then* stop the profiler. After mp.prof_stop()
@@ -485,7 +534,7 @@ def main():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-    if accelerator.is_main_process:
+    if args.profiler == "nsys" and accelerator.is_main_process:
         import model_prof as mp
         mp.prof_stop()
     return 0
