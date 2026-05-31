@@ -272,3 +272,6 @@ out_profile*/
 *.nsys-rep
 *.pt.trace.json
 *.pt.trace.json.gz
+
+# tools/ visualization artifacts
+tools/outputs/
