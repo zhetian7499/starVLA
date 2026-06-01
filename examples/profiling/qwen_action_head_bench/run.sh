@@ -21,6 +21,11 @@ ACTIVE_TORCH="${ACTIVE_TORCH:-2}"
 # Per-run sub-directory so re-runs don't clobber prior artifacts.
 # Override with RUN_TAG=foo to land in out_profile/foo/ instead.
 RUN_TAG="${RUN_TAG:-run_$(date +%Y%m%d_%H%M%S)}"
+# Spliced verbatim into both accelerate launch invocations. Use for OmegaConf
+# overrides (--set k=v), e.g. when switching backbone size requires a smaller
+# per-device batch:
+#   EXTRA_ARGS="--set datasets.vla_data.per_device_batch_size=1" ./run.sh
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 # === End of environment ===
 
 RUN_DIR="${OUT_DIR}/${RUN_TAG}"
@@ -110,6 +115,7 @@ for HEAD in ${HEADS}; do
             --active_steps "${ACTIVE}" \
             --cooldown_steps "${COOLDOWN}" \
             --profiler nsys \
+            ${EXTRA_ARGS} \
         2>&1 | tee "${REPORT_PREFIX_NSYS}.log"
 
     # Pass B: torch.profiler only. Skip bench_wrap entirely — no prof.sh / nsys
@@ -130,6 +136,7 @@ for HEAD in ${HEADS}; do
             --active_steps "${ACTIVE_TORCH}" \
             --cooldown_steps "${COOLDOWN}" \
             --profiler torch \
+            ${EXTRA_ARGS} \
         2>&1 | tee "${REPORT_PREFIX_TORCH}.log"
 done
 

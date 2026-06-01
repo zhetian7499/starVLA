@@ -39,6 +39,11 @@ def parse_args() -> argparse.Namespace:
                         "use two separate runs instead.")
     p.add_argument("--selftest_hooks", action="store_true",
                    help="Run a local hook-firing self-test and exit.")
+    p.add_argument("--set", dest="overrides", action="append", default=[],
+                   metavar="KEY=VAL",
+                   help="OmegaConf dotlist override (repeatable). Applied AFTER "
+                        "head/path overrides so --set wins on conflicts. "
+                        "Example: --set datasets.vla_data.per_device_batch_size=1")
     return p.parse_args()
 
 
@@ -64,6 +69,10 @@ def load_config(args: argparse.Namespace):
         "run_root_dir=./out",
     ])
     cfg = OmegaConf.merge(cfg, overrides)
+
+    # User-supplied --set k=v overrides win over the head/path defaults above.
+    if getattr(args, "overrides", None):
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(args.overrides)))
 
     # starVLA's config-compat shim, same as train_starvla.py
     from starVLA.model.framework.share_tools import apply_config_compat
