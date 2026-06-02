@@ -15,7 +15,7 @@ WARMUP="${WARMUP:-30}"
 ACTIVE="${ACTIVE:-10}"
 COOLDOWN="${COOLDOWN:-5}"
 # torch.profiler trace size grows linearly with active. Senior review: keep it
-# to 1-2 steps. 2 lets us check whether the first traced step is anomalously
+# to 1-2 steps. 2 lets us check whether
 # slow without blowing up the .pt.trace.json.gz size.
 ACTIVE_TORCH="${ACTIVE_TORCH:-2}"
 # Per-run sub-directory so re-runs don't clobber prior artifacts.

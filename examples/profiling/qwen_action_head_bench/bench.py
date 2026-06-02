@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
                         "use two separate runs instead.")
     p.add_argument("--selftest_hooks", action="store_true",
                    help="Run a local hook-firing self-test and exit.")
+    p.add_argument("--detailed_module_hooks", action="store_true",
+                   help="In addition to vlm_forward/action_head_forward, register "
+                        "NVTX + record_function on every leaf module (nn.Linear, "
+                        "RMSNorm, Attention, …). Annotates trace with 'mod:<path>:<type>' "
+                        "so per-module kernel attribution is possible. Skip-list keeps "
+                        "trace size in check by ignoring Dropout/Embedding/activations.")
     p.add_argument("--set", dest="overrides", action="append", default=[],
                    metavar="KEY=VAL",
                    help="OmegaConf dotlist override (repeatable). Applied AFTER "
@@ -197,6 +203,33 @@ def register_module_hooks(model: torch.nn.Module, name_to_module: dict) -> list:
         handles.append(module.register_forward_pre_hook(pre_h))
         handles.append(module.register_forward_hook(post_h))
     return handles
+
+
+_SKIP_HOOK_TYPES = (
+    torch.nn.Dropout, torch.nn.Identity, torch.nn.Embedding,
+    torch.nn.ReLU, torch.nn.GELU, torch.nn.SiLU, torch.nn.Tanh, torch.nn.Sigmoid,
+)
+
+
+def collect_leaf_hook_targets(root: torch.nn.Module) -> dict:
+    """Walk named_modules(), pick leafs (no children), skip cheap activation/dropout/embed.
+
+    Returns {label: module} where label is `mod:<path>:<ClassName>`. <path> uses
+    `named_modules()` convention (dot-separated, indices for ModuleList children).
+    Empty <path> = the root module itself; we skip that — root is the framework
+    wrapper which we already hook as `vlm_forward`/`action_head_forward`.
+    """
+    targets = {}
+    for name, m in root.named_modules():
+        if not name:  # root
+            continue
+        if list(m.children()):  # not a leaf
+            continue
+        if isinstance(m, _SKIP_HOOK_TYPES):
+            continue
+        label = f"mod:{name}:{type(m).__name__}"
+        targets[label] = m
+    return targets
 
 
 def _selftest_hooks():
@@ -507,6 +540,16 @@ def main():
         "vlm_forward": inner.qwen_vl_interface,
         "action_head_forward": inner.action_model,
     }
+    if args.detailed_module_hooks:
+        # Add per-leaf-module hooks for fine-grained kernel attribution.
+        # Walk under qwen_vl_interface (where ~all the FLOPs are) so we don't
+        # double-count the wrappers we already hook above.
+        leaf_targets = collect_leaf_hook_targets(inner.qwen_vl_interface)
+        # Namespace under qwen_vl_interface in the label so paths are reproducible.
+        hooks_target.update({f"vlm.{k}": v for k, v in leaf_targets.items()})
+        if accelerator.is_main_process:
+            print(f"[bench] detailed_module_hooks: registering {len(leaf_targets)} extra hooks "
+                  f"on qwen_vl_interface leaves")
 
     total_steps = args.warmup_steps + args.active_steps + args.cooldown_steps
     if args.profiler == "none":
