@@ -246,6 +246,10 @@ def main():
     fast_processor.action_dim = int(cfg.framework.action_model.action_dim)
 
     _ensure_dist()
+    # starVLA's dataloader writes dataset_statistics.json to cfg.output_dir on
+    # rank 0 — same workaround bench.py uses (bench.py:515).
+    cfg.output_dir = str(Path(args.output).parent)
+    Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
     print(f"[stats] building dataloader ...")
     from starVLA.dataloader import build_dataloader
     loader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
