@@ -182,14 +182,19 @@ def prof_range(name: str):
             torch.cuda.nvtx.range_pop()
 
 
-def register_module_hooks(model: torch.nn.Module, name_to_module: dict) -> list:
+def register_module_hooks(model: torch.nn.Module, name_to_module: dict,
+                          also_backward: bool = False) -> list:
     """Attach pre/post forward hooks that push NVTX + record_function around each module.
+
+    If also_backward=True, additionally attach register_full_backward_{pre,post}_hook
+    so backward-time kernels can also be attributed. The backward annotation uses
+    the label prefix 'bwd:' to disambiguate from forward in the resulting trace.
 
     Returns a list of hook handles so the caller can `.remove()` them later.
     """
     handles = []
     for label, module in name_to_module.items():
-        def make_hooks(_label):
+        def make_fwd_hooks(_label):
             def pre(mod, _inputs):
                 if torch.cuda.is_available():
                     torch.cuda.nvtx.range_push(_label)
@@ -204,9 +209,29 @@ def register_module_hooks(model: torch.nn.Module, name_to_module: dict) -> list:
                 if torch.cuda.is_available():
                     torch.cuda.nvtx.range_pop()
             return pre, post
-        pre_h, post_h = make_hooks(label)
+        pre_h, post_h = make_fwd_hooks(label)
         handles.append(module.register_forward_pre_hook(pre_h))
         handles.append(module.register_forward_hook(post_h))
+        if also_backward:
+            bwd_label = f"bwd:{label}"
+            def make_bwd_hooks(_label):
+                def bpre(mod, _grad_output):
+                    if torch.cuda.is_available():
+                        torch.cuda.nvtx.range_push(_label)
+                    rf = torch.profiler.record_function(_label)
+                    rf.__enter__()
+                    mod._bench_bwd_prof_ctx = rf
+                def bpost(mod, _grad_input, _grad_output):
+                    ctx = getattr(mod, "_bench_bwd_prof_ctx", None)
+                    if ctx is not None:
+                        ctx.__exit__(None, None, None)
+                        del mod._bench_bwd_prof_ctx
+                    if torch.cuda.is_available():
+                        torch.cuda.nvtx.range_pop()
+                return bpre, bpost
+            bpre_h, bpost_h = make_bwd_hooks(bwd_label)
+            handles.append(module.register_full_backward_pre_hook(bpre_h))
+            handles.append(module.register_full_backward_hook(bpost_h))
     return handles
 
 
@@ -337,7 +362,8 @@ def run_loop_nsys(model, optimizer, batch, args, hooks_target, accelerator):
     import model_prof as mp
 
     if hooks_target is not None:
-        register_module_hooks(model, hooks_target)
+        register_module_hooks(model, hooks_target,
+                              also_backward=getattr(args, "detailed_module_hooks", False))
 
     warmup, active, cooldown = args.warmup_steps, args.active_steps, args.cooldown_steps
     total = warmup + active + cooldown
@@ -382,7 +408,8 @@ def run_loop_torch(model, optimizer, batch, args, hooks_target, accelerator):
     must route through DeepSpeed engine via `accelerator.backward(loss)`.
     """
     if hooks_target is not None:
-        register_module_hooks(model, hooks_target)
+        register_module_hooks(model, hooks_target,
+                              also_backward=getattr(args, "detailed_module_hooks", False))
 
     warmup, active, cooldown = args.warmup_steps, args.active_steps, args.cooldown_steps
     total = warmup + active + cooldown
