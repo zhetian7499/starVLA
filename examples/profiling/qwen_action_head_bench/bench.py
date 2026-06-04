@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
                         "RMSNorm, Attention, …). Annotates trace with 'mod:<path>:<type>' "
                         "so per-module kernel attribution is possible. Skip-list keeps "
                         "trace size in check by ignoring Dropout/Embedding/activations.")
+    p.add_argument("--with_stack", action="store_true",
+                   help="Pass with_stack=True to torch.profiler.profile so "
+                        "each event carries a Python call stack. Inflates "
+                        "chrome trace size ~5-10x; only enable when you need "
+                        "callsite attribution. nsys pass is unaffected.")
     p.add_argument("--set", dest="overrides", action="append", default=[],
                    metavar="KEY=VAL",
                    help="OmegaConf dotlist override (repeatable). Applied AFTER "
@@ -402,7 +407,7 @@ def run_loop_torch(model, optimizer, batch, args, hooks_target, accelerator):
         on_trace_ready=torch.profiler.tensorboard_trace_handler(str(tb_dir)),
         record_shapes=True,
         profile_memory=False,
-        with_stack=False,
+        with_stack=args.with_stack,
     ) as tp_prof:
         for step in range(total):
             t0 = time.perf_counter()

@@ -58,7 +58,6 @@ class _QWen3_5_VL_Interface(nn.Module):
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-VL-4B-Instruct")
         attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
 
-        attn_implementation = "sdpa"
         # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
         if attn_implementation == "flash_attention_2":
             try:
@@ -78,6 +77,14 @@ class _QWen3_5_VL_Interface(nn.Module):
         self.model = model
         self.processor = processor
         self.config = config
+
+        # === BEGIN torch.compile (profiling-bench, REVERT: delete this block) ===
+        # Wraps only the VLM backbone, not _QWen3_5_VL_Interface itself, so
+        # DeepSpeed sees real nn.Parameters and not compiled-graph artifacts.
+        # Off by default; enable via `--set framework.qwenvl.torch_compile=true`.
+        if qwenvl_config.get("torch_compile", False):
+            self.model = torch.compile(self.model)
+        # === END torch.compile ===
 
         # alin qwen3.5 with qwen2.5
         self.model.config.hidden_size = self.model.config.text_config.hidden_size
