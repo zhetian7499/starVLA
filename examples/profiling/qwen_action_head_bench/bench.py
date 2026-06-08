@@ -438,15 +438,25 @@ def run_loop_torch(model, optimizer, batch, args, hooks_target, accelerator):
     ) as tp_prof:
         for step in range(total):
             t0 = time.perf_counter()
-            with prof_range("step_total"):
+            if args.with_stack:
+                # with_stack + record_function triggers PyTorch profiler bug
+                # (profiler_python.cpp:983). Python stack alone gives callsite info.
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     out = model(batch)
                     loss = out["action_loss"]
-                with prof_range("backward"):
-                    accelerator.backward(loss)
-                with prof_range("optimizer_step"):
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
+                accelerator.backward(loss)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                with prof_range("step_total"):
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        out = model(batch)
+                        loss = out["action_loss"]
+                    with prof_range("backward"):
+                        accelerator.backward(loss)
+                    with prof_range("optimizer_step"):
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
             torch.cuda.synchronize()
             step_times.append(time.perf_counter() - t0)
             tp_prof.step()
