@@ -602,7 +602,11 @@ def main():
     if args.profiler == "nsys":
         step_times = run_loop_nsys(model, optimizer, batch, args, hooks_target, accelerator)
     else:  # "torch"
-        step_times = run_loop_torch(model, optimizer, batch, args, hooks_target, accelerator)
+        # with_stack + hook-based record_function triggers PyTorch profiler bug
+        # (profiler_python.cpp:983 "Python replay stack is empty"). The Python
+        # call stack already encodes module hierarchy, so hooks are redundant.
+        torch_hooks = None if args.with_stack else hooks_target
+        step_times = run_loop_torch(model, optimizer, batch, args, torch_hooks, accelerator)
     mean_traced = sum(step_times[args.warmup_steps:args.warmup_steps+args.active_steps]) / max(args.active_steps, 1)
 
     if accelerator.is_main_process:
