@@ -439,25 +439,15 @@ def run_loop_torch(model, optimizer, batch, args, hooks_target, accelerator):
     ) as tp_prof:
         for step in range(total):
             t0 = time.perf_counter()
-            if args.with_stack:
-                # with_stack + record_function triggers PyTorch profiler bug
-                # (profiler_python.cpp:983). Python stack alone gives callsite info.
+            with prof_range("step_total"):
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     out = model(batch)
                     loss = out["action_loss"]
-                accelerator.backward(loss)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            else:
-                with prof_range("step_total"):
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
-                        out = model(batch)
-                        loss = out["action_loss"]
-                    with prof_range("backward"):
-                        accelerator.backward(loss)
-                    with prof_range("optimizer_step"):
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
+                with prof_range("backward"):
+                    accelerator.backward(loss)
+                with prof_range("optimizer_step"):
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
             torch.cuda.synchronize()
             step_times.append(time.perf_counter() - t0)
             tp_prof.step()
@@ -613,11 +603,7 @@ def main():
     if args.profiler == "nsys":
         step_times = run_loop_nsys(model, optimizer, batch, args, hooks_target, accelerator)
     else:  # "torch"
-        # with_stack + hook-based record_function triggers PyTorch profiler bug
-        # (profiler_python.cpp:983 "Python replay stack is empty"). The Python
-        # call stack already encodes module hierarchy, so hooks are redundant.
-        torch_hooks = None if args.with_stack else hooks_target
-        step_times = run_loop_torch(model, optimizer, batch, args, torch_hooks, accelerator)
+        step_times = run_loop_torch(model, optimizer, batch, args, hooks_target, accelerator)
     mean_traced = sum(step_times[args.warmup_steps:args.warmup_steps+args.active_steps]) / max(args.active_steps, 1)
 
     if accelerator.is_main_process:
