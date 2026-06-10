@@ -542,12 +542,22 @@ def ensure_dist_initialized():
     dist.init_process_group(backend=backend)
 
 
+def _unique_output_dir(base: str) -> str:
+    """Append a short random hex suffix to the output directory to prevent
+    accidental overwrites when re-running with the same --output_dir."""
+    import hashlib
+    # 4 hex chars from hash of (base path + current time) → 65k namespace
+    tag = hashlib.md5(f"{base}{time.time()}".encode()).hexdigest()[:4]
+    return f"{base}_{tag}"
+
+
 def main():
     args = parse_args()
     if args.selftest_hooks:
         _selftest_hooks()
         return 0
     cfg = load_config(args)
+    args.output_dir = _unique_output_dir(args.output_dir)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     # starVLA's dataloader writes dataset_statistics.json to cfg.output_dir on rank 0.
     cfg.output_dir = args.output_dir
