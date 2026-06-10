@@ -97,14 +97,18 @@ if [ ! -x "${PROF_DIR}/model_prof/tool/prof.sh" ]; then
 fi
 
 for HEAD in ${HEADS}; do
+    HEAD_DIR="${RUN_DIR}/${HEAD}"
+    mkdir -p "${HEAD_DIR}"
+
     echo "============================================================"
     echo "[run.sh] head=${HEAD}: two passes (nsys, then torch.profiler)"
+    echo "[run.sh] output -> ${HEAD_DIR}/"
     echo "============================================================"
 
     # Pass A: nsys / asys via prof.sh (rank-0 only). bench.py runs in --profiler nsys
     # mode so torch.profiler is OFF — running both at once doubles CUPTI
     # subscribers and pollutes per-step timing.
-    REPORT_PREFIX_NSYS="${RUN_DIR}/bench_${HEAD}_nsys"
+    REPORT_PREFIX_NSYS="${HEAD_DIR}/bench_${HEAD}_nsys"
     echo "[run.sh]  -> pass A (nsys)  out=${REPORT_PREFIX_NSYS}"
     PROF_DIR="${PROF_DIR}" REPORT_PREFIX="${REPORT_PREFIX_NSYS}" \
         accelerate launch \
@@ -114,7 +118,7 @@ for HEAD in ${HEADS}; do
             --head "${HEAD}" \
             --base_vlm "${BASE_VLM}" \
             --data_root "${DATA_ROOT}" \
-            --output_dir "${RUN_DIR}" \
+            --output_dir "${HEAD_DIR}" \
             --batch_path "${BATCH_CACHE}" \
             --warmup_steps "${WARMUP}" \
             --active_steps "${ACTIVE}" \
@@ -126,7 +130,7 @@ for HEAD in ${HEADS}; do
     # Pass B: torch.profiler only. Skip bench_wrap entirely — no prof.sh / nsys
     # on rank 0 — so torch.profiler sees a clean run. Fewer active steps to keep
     # the trace small per senior review.
-    REPORT_PREFIX_TORCH="${RUN_DIR}/bench_${HEAD}_torch"
+    REPORT_PREFIX_TORCH="${HEAD_DIR}/bench_${HEAD}_torch"
     echo "[run.sh]  -> pass B (torch) out=${REPORT_PREFIX_TORCH} (active=${ACTIVE_TORCH})"
     accelerate launch \
             --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
@@ -135,7 +139,7 @@ for HEAD in ${HEADS}; do
             --head "${HEAD}" \
             --base_vlm "${BASE_VLM}" \
             --data_root "${DATA_ROOT}" \
-            --output_dir "${RUN_DIR}" \
+            --output_dir "${HEAD_DIR}" \
             --batch_path "${BATCH_CACHE}" \
             --warmup_steps "${WARMUP}" \
             --active_steps "${ACTIVE_TORCH}" \
