@@ -11,6 +11,7 @@ HEAD_TO_FRAMEWORK = {
     "OFT": "QwenOFT",
     "PI": "QwenPI",
     "FAST": "QwenFast",
+    "GR00T": "QwenGR00T",
 }
 
 
