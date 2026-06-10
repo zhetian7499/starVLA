@@ -50,6 +50,10 @@ def parse_args() -> argparse.Namespace:
                         "each event carries a Python call stack. Inflates "
                         "chrome trace size ~5-10x; only enable when you need "
                         "callsite attribution. nsys pass is unaffected.")
+    p.add_argument("--batch_size_override", type=int, default=None,
+                   help="If set, slice frozen batch to this size after loading. "
+                        "Use when the full frozen batch OOMs (e.g. torch >=2.7 "
+                        "uses more memory than 2.6 for the same model).")
     p.add_argument("--set", dest="overrides", action="append", default=[],
                    metavar="KEY=VAL",
                    help="OmegaConf dotlist override (repeatable). Applied AFTER "
@@ -561,6 +565,9 @@ def main():
     loader = build_loader(cfg)
     batch_path = args.batch_path or str(Path(args.output_dir) / "fixed_batch.pt")
     batch = get_or_dump_batch(loader, batch_path)
+    if args.batch_size_override and hasattr(batch, '__len__'):
+        batch = batch[:args.batch_size_override]
+        print(f"[bench] sliced batch to {args.batch_size_override} (--batch_size_override)")
     print(f"[bench] batch type = {type(batch).__name__}, len = {len(batch) if hasattr(batch, '__len__') else '?'}")
 
     accelerator = setup_accelerator(int(cfg.datasets.vla_data.per_device_batch_size))
