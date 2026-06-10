@@ -434,7 +434,7 @@ def run_loop_torch(model, optimizer, batch, args, hooks_target, accelerator):
         on_trace_ready=torch.profiler.tensorboard_trace_handler(str(tb_dir)),
         record_shapes=True,
         profile_memory=False,
-        with_stack=False,
+        with_stack=args.with_stack,
         with_modules=args.with_stack,
     ) as tp_prof:
         for step in range(total):
