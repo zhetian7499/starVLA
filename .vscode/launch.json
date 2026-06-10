@@ -1,0 +1,37 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Attach: bench.py (remote H20)",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": {
+        "host": "wulanchabu-h20-2",
+        "port": 5678
+      },
+      "pathMappings": [
+        {
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "/workspace/starVLA"
+        }
+      ],
+      "justMyCode": false
+    },
+    {
+      "name": "Attach: bench.py (remote H20, rank 0 only)",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": {
+        "host": "wulanchabu-h20-2",
+        "port": 5679
+      },
+      "pathMappings": [
+        {
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "/workspace/starVLA"
+        }
+      ],
+      "justMyCode": false
+    }
+  ]
+}

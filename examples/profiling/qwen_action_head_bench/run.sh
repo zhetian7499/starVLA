@@ -19,8 +19,11 @@ COOLDOWN="${COOLDOWN:-5}"
 # slow without blowing up the .pt.trace.json.gz size.
 ACTIVE_TORCH="${ACTIVE_TORCH:-2}"
 # Per-run sub-directory so re-runs don't clobber prior artifacts.
-# Override with RUN_TAG=foo to land in out_profile/foo/ instead.
+# Override with RUN_TAG=foo to land in out_profile/0610_foo/ (date auto-prepended).
+# The date prefix makes chronological sorting trivial and prevents name collisions.
+_DATE_PREFIX="$(date +%m%d)"
 RUN_TAG="${RUN_TAG:-run_$(date +%Y%m%d_%H%M%S)}"
+RUN_TAG="${_DATE_PREFIX}_${RUN_TAG}"
 # Spliced verbatim into both accelerate launch invocations. Use for OmegaConf
 # overrides (--set k=v), e.g. when switching backbone size requires a smaller
 # per-device batch:
