@@ -581,6 +581,25 @@ def main():
         "vlm_forward": inner.qwen_vl_interface,
         "action_head_forward": inner.action_model,
     }
+
+    # --- Head-specific hook adjustments ---
+    # OFT: forward() calls action_model.predict_action(), which internally
+    # calls self.model(x) (MLPResNet).  register_forward_hook only fires on
+    # __call__, so the hook on action_model never triggers.  Re-target to the
+    # inner MLPResNet so the hook actually fires.
+    if args.head == "OFT" and hasattr(inner.action_model, "model"):
+        hooks_target["action_head_forward"] = inner.action_model.model
+
+    # FAST: action_model is a CPU-only tokenizer (numpy BPE encode); no GPU
+    # forward exists.  Wrap encoder_action2fastoken with record_function so
+    # the tokenization cost is visible in the torch.profiler trace.
+    if args.head == "FAST" and hasattr(inner.action_model, "encoder_action2fastoken"):
+        _orig_encode = inner.action_model.encoder_action2fastoken
+        def _wrapped_encode(*a, **kw):
+            with torch.profiler.record_function("fast_tokenize_cpu"):
+                return _orig_encode(*a, **kw)
+        inner.action_model.encoder_action2fastoken = _wrapped_encode
+
     if args.detailed_module_hooks:
         # Add per-leaf-module hooks for fine-grained kernel attribution.
         # Walk under qwen_vl_interface (where ~all the FLOPs are) so we don't
@@ -588,9 +607,15 @@ def main():
         leaf_targets = collect_leaf_hook_targets(inner.qwen_vl_interface)
         # Namespace under qwen_vl_interface in the label so paths are reproducible.
         hooks_target.update({f"vlm.{k}": v for k, v in leaf_targets.items()})
+
+        # Also walk action_model leaves so DiT cross-attention layers (PI/GR00T)
+        # and MLP blocks (OFT) show up individually in the trace.
+        action_leaf_targets = collect_leaf_hook_targets(inner.action_model)
+        hooks_target.update({f"action.{k}": v for k, v in action_leaf_targets.items()})
+
         if accelerator.is_main_process:
-            print(f"[bench] detailed_module_hooks: registering {len(leaf_targets)} extra hooks "
-                  f"on qwen_vl_interface leaves")
+            print(f"[bench] detailed_module_hooks: registering {len(leaf_targets)} vlm + "
+                  f"{len(action_leaf_targets)} action_model leaf hooks")
 
     total_steps = args.warmup_steps + args.active_steps + args.cooldown_steps
     if args.profiler == "none":
